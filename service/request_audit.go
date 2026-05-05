@@ -22,6 +22,8 @@ const (
 	requestContentAuditMaxBytesEnv      = "REQUEST_CONTENT_AUDIT_MAX_BYTES"
 	requestContentAuditIncludeSystemEnv = "REQUEST_CONTENT_AUDIT_INCLUDE_SYSTEM"
 	requestContentAuditScopeEnv         = "REQUEST_CONTENT_AUDIT_SCOPE"
+	requestContentAuditDedupeEnabledEnv = "REQUEST_CONTENT_AUDIT_DEDUPE_ENABLED"
+	requestContentAuditDedupeWindowEnv  = "REQUEST_CONTENT_AUDIT_DEDUPE_WINDOW_SECONDS"
 
 	auditScopeCurrentUser = "current_user"
 	auditScopeAllUser     = "all_user"
@@ -29,6 +31,7 @@ const (
 
 	defaultRequestContentAuditMaxBytes = 65535
 	defaultRequestContentAuditScope    = auditScopeCurrentUser
+	defaultRequestContentDedupeWindow  = 300
 	omittedAuditValue                  = "[omitted]"
 )
 
@@ -47,7 +50,13 @@ func RecordRequestContentAuditAsync(c *gin.Context, relayInfo *relaycommon.Relay
 	}
 
 	gopool.Go(func() {
-		if err := model.RecordRequestContentLog(entry); err != nil {
+		var err error
+		if requestContentAuditDedupeEnabled() {
+			err = model.RecordRequestContentLogWithDedupe(entry, requestContentAuditDedupeWindowSeconds())
+		} else {
+			err = model.RecordRequestContentLog(entry)
+		}
+		if err != nil {
 			logger.LogError(c, "failed to record request content audit log: "+err.Error())
 		}
 	})
@@ -73,6 +82,18 @@ func requestContentAuditScope() string {
 	default:
 		return defaultRequestContentAuditScope
 	}
+}
+
+func requestContentAuditDedupeEnabled() bool {
+	return common.GetEnvOrDefaultBool(requestContentAuditDedupeEnabledEnv, true)
+}
+
+func requestContentAuditDedupeWindowSeconds() int64 {
+	window := common.GetEnvOrDefault(requestContentAuditDedupeWindowEnv, defaultRequestContentDedupeWindow)
+	if window <= 0 {
+		return int64(defaultRequestContentDedupeWindow)
+	}
+	return int64(window)
 }
 
 func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, request dto.Request, channelId int) (*model.RequestContentLog, error) {
@@ -114,23 +135,28 @@ func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, re
 	if channelId == 0 {
 		channelId = relayInfo.ChannelId
 	}
+	now := common.GetTimestamp()
+	requestId := c.GetString(common.RequestIdKey)
 
 	return &model.RequestContentLog{
-		RequestId:   c.GetString(common.RequestIdKey),
-		UserId:      relayInfo.UserId,
-		Username:    username,
-		TokenId:     relayInfo.TokenId,
-		TokenName:   tokenName,
-		ChannelId:   channelId,
-		ModelName:   relayInfo.OriginModelName,
-		Group:       relayInfo.UsingGroup,
-		RelayMode:   relayInfo.RelayMode,
-		Path:        c.Request.URL.Path,
-		Content:     string(contentBytes),
-		ContentText: contentText,
-		ContentHash: hex.EncodeToString(sum[:]),
-		Truncated:   truncated,
-		CreatedAt:   common.GetTimestamp(),
+		RequestId:      requestId,
+		UserId:         relayInfo.UserId,
+		Username:       username,
+		TokenId:        relayInfo.TokenId,
+		TokenName:      tokenName,
+		ChannelId:      channelId,
+		ModelName:      relayInfo.OriginModelName,
+		Group:          relayInfo.UsingGroup,
+		RelayMode:      relayInfo.RelayMode,
+		Path:           c.Request.URL.Path,
+		Content:        string(contentBytes),
+		ContentText:    contentText,
+		ContentHash:    hex.EncodeToString(sum[:]),
+		DuplicateCount: 1,
+		LastRequestId:  requestId,
+		LastSeenAt:     now,
+		Truncated:      truncated,
+		CreatedAt:      now,
 	}, nil
 }
 
