@@ -26,6 +26,7 @@ type RequestContentLog struct {
 	DuplicateCount int    `json:"duplicate_count" gorm:"default:1"`
 	LastRequestId  string `json:"last_request_id" gorm:"type:varchar(64);index;default:''"`
 	LastSeenAt     int64  `json:"last_seen_at" gorm:"bigint;index;default:0"`
+	StorageBytes   int64  `json:"storage_bytes" gorm:"bigint;index;default:0"`
 	Truncated      bool   `json:"truncated"`
 	CreatedAt      int64  `json:"created_at" gorm:"bigint;index:idx_request_content_created_id,priority:2"`
 }
@@ -48,6 +49,7 @@ type RequestContentLogListItem struct {
 	DuplicateCount int    `json:"duplicate_count"`
 	LastRequestId  string `json:"last_request_id"`
 	LastSeenAt     int64  `json:"last_seen_at"`
+	StorageBytes   int64  `json:"storage_bytes"`
 	Truncated      bool   `json:"truncated"`
 	CreatedAt      int64  `json:"created_at"`
 }
@@ -155,6 +157,76 @@ func DeleteOldRequestContentLog(ctx context.Context, targetTimestamp int64, limi
 	return total, nil
 }
 
+func EnforceRequestContentLogStorageLimit(ctx context.Context, maxBytes int64, targetBytes int64, batchSize int) (deleted int64, totalBytes int64, err error) {
+	if LOG_DB == nil {
+		return 0, 0, errors.New("log database is not initialized")
+	}
+	if maxBytes <= 0 {
+		return 0, 0, nil
+	}
+	if targetBytes <= 0 || targetBytes >= maxBytes {
+		targetBytes = maxBytes * 9 / 10
+	}
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	cleanupStarted := false
+	for {
+		if ctx.Err() != nil {
+			return deleted, totalBytes, ctx.Err()
+		}
+		totalBytes, err = GetRequestContentLogStorageBytes(ctx)
+		if err != nil {
+			return deleted, totalBytes, err
+		}
+		if !cleanupStarted {
+			if totalBytes <= maxBytes {
+				return deleted, totalBytes, nil
+			}
+			cleanupStarted = true
+		}
+		if totalBytes <= targetBytes {
+			return deleted, totalBytes, nil
+		}
+
+		var ids []int
+		err = LOG_DB.WithContext(ctx).
+			Model(&RequestContentLog{}).
+			Order(requestContentLogSeenAtExpr()+" ASC").
+			Order("request_content_logs.created_at ASC").
+			Order("request_content_logs.id ASC").
+			Limit(batchSize).
+			Pluck("request_content_logs.id", &ids).Error
+		if err != nil {
+			return deleted, totalBytes, err
+		}
+		if len(ids) == 0 {
+			return deleted, totalBytes, nil
+		}
+
+		result := LOG_DB.WithContext(ctx).Delete(&RequestContentLog{}, ids)
+		if result.Error != nil {
+			return deleted, totalBytes, result.Error
+		}
+		deleted += result.RowsAffected
+		if result.RowsAffected == 0 {
+			return deleted, totalBytes, nil
+		}
+	}
+}
+
+func GetRequestContentLogStorageBytes(ctx context.Context) (int64, error) {
+	if LOG_DB == nil {
+		return 0, errors.New("log database is not initialized")
+	}
+	var totalBytes int64
+	err := LOG_DB.WithContext(ctx).
+		Model(&RequestContentLog{}).
+		Select(requestContentLogStorageSumExpr()).
+		Scan(&totalBytes).Error
+	return totalBytes, err
+}
+
 func buildRequestContentLogQuery(query RequestContentLogQuery) (*gorm.DB, error) {
 	tx := LOG_DB.Model(&RequestContentLog{})
 	if query.UserId != 0 {
@@ -222,6 +294,7 @@ func requestContentLogListSelectClause() string {
 		"request_content_logs.duplicate_count, " +
 		"request_content_logs.last_request_id, " +
 		"request_content_logs.last_seen_at, " +
+		"CASE WHEN request_content_logs.storage_bytes > 0 THEN request_content_logs.storage_bytes ELSE LENGTH(request_content_logs.content) + LENGTH(request_content_logs.content_text) + 1024 END AS storage_bytes, " +
 		"request_content_logs.truncated, " +
 		"request_content_logs.created_at"
 }
@@ -239,8 +312,19 @@ func prepareRequestContentLogDefaults(log *RequestContentLog) {
 	if log.DuplicateCount <= 0 {
 		log.DuplicateCount = 1
 	}
+	if log.StorageBytes <= 0 {
+		log.StorageBytes = EstimateRequestContentLogStorageBytes(log.Content, log.ContentText)
+	}
 }
 
 func requestContentLogSeenAtExpr() string {
 	return "CASE WHEN request_content_logs.last_seen_at > 0 THEN request_content_logs.last_seen_at ELSE request_content_logs.created_at END"
+}
+
+func requestContentLogStorageSumExpr() string {
+	return "COALESCE(SUM(CASE WHEN request_content_logs.storage_bytes > 0 THEN request_content_logs.storage_bytes ELSE LENGTH(request_content_logs.content) + LENGTH(request_content_logs.content_text) + 1024 END), 0)"
+}
+
+func EstimateRequestContentLogStorageBytes(content string, contentText string) int64 {
+	return int64(len(content) + len(contentText) + 1024)
 }

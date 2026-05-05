@@ -1,10 +1,13 @@
 package service
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -24,6 +27,9 @@ const (
 	requestContentAuditScopeEnv         = "REQUEST_CONTENT_AUDIT_SCOPE"
 	requestContentAuditDedupeEnabledEnv = "REQUEST_CONTENT_AUDIT_DEDUPE_ENABLED"
 	requestContentAuditDedupeWindowEnv  = "REQUEST_CONTENT_AUDIT_DEDUPE_WINDOW_SECONDS"
+	requestContentAuditMaxStorageEnv    = "REQUEST_CONTENT_AUDIT_MAX_STORAGE_BYTES"
+	requestContentAuditCleanupRatioEnv  = "REQUEST_CONTENT_AUDIT_CLEANUP_TARGET_RATIO"
+	requestContentAuditCleanupBatchEnv  = "REQUEST_CONTENT_AUDIT_CLEANUP_BATCH_SIZE"
 
 	auditScopeCurrentUser = "current_user"
 	auditScopeAllUser     = "all_user"
@@ -32,8 +38,13 @@ const (
 	defaultRequestContentAuditMaxBytes = 65535
 	defaultRequestContentAuditScope    = auditScopeCurrentUser
 	defaultRequestContentDedupeWindow  = 300
+	defaultRequestContentMaxStorage    = int64(20 * 1024 * 1024 * 1024)
+	defaultRequestContentCleanupRatio  = 0.9
+	defaultRequestContentCleanupBatch  = 1000
 	omittedAuditValue                  = "[omitted]"
 )
+
+var requestContentAuditCleanupRunning atomic.Bool
 
 func RecordRequestContentAuditAsync(c *gin.Context, relayInfo *relaycommon.RelayInfo, request dto.Request, channelId int) {
 	if !requestContentAuditEnabled() || c == nil || relayInfo == nil || request == nil {
@@ -58,7 +69,9 @@ func RecordRequestContentAuditAsync(c *gin.Context, relayInfo *relaycommon.Relay
 		}
 		if err != nil {
 			logger.LogError(c, "failed to record request content audit log: "+err.Error())
+			return
 		}
+		enforceRequestContentAuditStorageLimit()
 	})
 }
 
@@ -94,6 +107,61 @@ func requestContentAuditDedupeWindowSeconds() int64 {
 		return int64(defaultRequestContentDedupeWindow)
 	}
 	return int64(window)
+}
+
+func requestContentAuditMaxStorageBytes() int64 {
+	raw := strings.TrimSpace(common.GetEnvOrDefaultString(requestContentAuditMaxStorageEnv, strconv.FormatInt(defaultRequestContentMaxStorage, 10)))
+	if raw == "" {
+		return defaultRequestContentMaxStorage
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		common.SysError("failed to parse " + requestContentAuditMaxStorageEnv + ": " + err.Error())
+		return defaultRequestContentMaxStorage
+	}
+	return value
+}
+
+func requestContentAuditCleanupTargetRatio() float64 {
+	raw := strings.TrimSpace(common.GetEnvOrDefaultString(requestContentAuditCleanupRatioEnv, strconv.FormatFloat(defaultRequestContentCleanupRatio, 'f', -1, 64)))
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		common.SysError("failed to parse " + requestContentAuditCleanupRatioEnv + ": " + err.Error())
+		return defaultRequestContentCleanupRatio
+	}
+	if value <= 0 || value >= 1 {
+		return defaultRequestContentCleanupRatio
+	}
+	return value
+}
+
+func requestContentAuditCleanupBatchSize() int {
+	batchSize := common.GetEnvOrDefault(requestContentAuditCleanupBatchEnv, defaultRequestContentCleanupBatch)
+	if batchSize <= 0 {
+		return defaultRequestContentCleanupBatch
+	}
+	return batchSize
+}
+
+func enforceRequestContentAuditStorageLimit() {
+	maxBytes := requestContentAuditMaxStorageBytes()
+	if maxBytes <= 0 {
+		return
+	}
+	if !requestContentAuditCleanupRunning.CompareAndSwap(false, true) {
+		return
+	}
+	defer requestContentAuditCleanupRunning.Store(false)
+
+	targetBytes := int64(float64(maxBytes) * requestContentAuditCleanupTargetRatio())
+	deleted, totalBytes, err := model.EnforceRequestContentLogStorageLimit(context.Background(), maxBytes, targetBytes, requestContentAuditCleanupBatchSize())
+	if err != nil {
+		logger.LogError(context.Background(), "failed to enforce request content audit storage limit: "+err.Error())
+		return
+	}
+	if deleted > 0 {
+		logger.LogInfo(context.Background(), "request content audit storage cleanup removed "+strconv.FormatInt(deleted, 10)+" rows, estimated remaining bytes "+strconv.FormatInt(totalBytes, 10))
+	}
 }
 
 func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, request dto.Request, channelId int) (*model.RequestContentLog, error) {
@@ -155,6 +223,7 @@ func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, re
 		DuplicateCount: 1,
 		LastRequestId:  requestId,
 		LastSeenAt:     now,
+		StorageBytes:   model.EstimateRequestContentLogStorageBytes(string(contentBytes), contentText),
 		Truncated:      truncated,
 		CreatedAt:      now,
 	}, nil
