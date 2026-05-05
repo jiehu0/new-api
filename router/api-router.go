@@ -304,6 +304,13 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			logRoute.GET("/token", middleware.TokenAuthReadOnly(), controller.GetLogByKey)
 		}
+		requestContentRoute := apiRouter.Group("/request-content")
+		requestContentRoute.Use(middleware.AdminAuth())
+		{
+			requestContentRoute.GET("/", controller.GetRequestContentLogs)
+			requestContentRoute.GET("/:request_id", controller.GetRequestContentLogByRequestId)
+			requestContentRoute.DELETE("/", controller.DeleteHistoryRequestContentLogs)
+		}
 		groupRoute := apiRouter.Group("/group")
 		groupRoute.Use(middleware.AdminAuth())
 		{

@@ -185,6 +185,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	auditRecorded := false
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -193,6 +194,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
 			break
+		}
+		if !auditRecorded {
+			service.RecordRequestContentAuditAsync(c, relayInfo, request, channel.Id)
+			auditRecorded = true
 		}
 
 		addUsedChannel(c, channel.Id)
