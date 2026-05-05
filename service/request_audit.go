@@ -21,8 +21,15 @@ const (
 	requestContentAuditEnabledEnv       = "REQUEST_CONTENT_AUDIT_ENABLED"
 	requestContentAuditMaxBytesEnv      = "REQUEST_CONTENT_AUDIT_MAX_BYTES"
 	requestContentAuditIncludeSystemEnv = "REQUEST_CONTENT_AUDIT_INCLUDE_SYSTEM"
-	defaultRequestContentAuditMaxBytes  = 65535
-	omittedAuditValue                   = "[omitted]"
+	requestContentAuditScopeEnv         = "REQUEST_CONTENT_AUDIT_SCOPE"
+
+	auditScopeCurrentUser = "current_user"
+	auditScopeAllUser     = "all_user"
+	auditScopeFull        = "full"
+
+	defaultRequestContentAuditMaxBytes = 65535
+	defaultRequestContentAuditScope    = auditScopeCurrentUser
+	omittedAuditValue                  = "[omitted]"
 )
 
 func RecordRequestContentAuditAsync(c *gin.Context, relayInfo *relaycommon.RelayInfo, request dto.Request, channelId int) {
@@ -50,6 +57,24 @@ func requestContentAuditEnabled() bool {
 	return common.GetEnvOrDefaultBool(requestContentAuditEnabledEnv, false)
 }
 
+func requestContentAuditIncludeSystem() bool {
+	return common.GetEnvOrDefaultBool(requestContentAuditIncludeSystemEnv, false)
+}
+
+func requestContentAuditScope() string {
+	scope := strings.ToLower(strings.TrimSpace(common.GetEnvOrDefaultString(requestContentAuditScopeEnv, defaultRequestContentAuditScope)))
+	switch scope {
+	case auditScopeCurrentUser, "current", "latest":
+		return auditScopeCurrentUser
+	case auditScopeAllUser, "all_user_messages", "all":
+		return auditScopeAllUser
+	case auditScopeFull:
+		return auditScopeFull
+	default:
+		return defaultRequestContentAuditScope
+	}
+}
+
 func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, request dto.Request, channelId int) (*model.RequestContentLog, error) {
 	content := buildAuditContent(relayInfo, request)
 	if len(content) == 0 {
@@ -58,9 +83,6 @@ func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, re
 
 	sanitized := sanitizeAuditValue(content)
 	contentText := strings.Join(collectAuditText("", sanitized), "\n")
-	if strings.TrimSpace(contentText) == "" {
-		contentText = strings.Join(collectAuditText("", content), "\n")
-	}
 
 	contentBytes, err := common.Marshal(sanitized)
 	if err != nil {
@@ -117,8 +139,56 @@ func buildAuditContent(relayInfo *relaycommon.RelayInfo, request dto.Request) ma
 		"model":      relayInfo.OriginModelName,
 		"relay_mode": relayInfo.RelayMode,
 	}
-	includeSystem := common.GetEnvOrDefaultBool(requestContentAuditIncludeSystemEnv, true)
+	includeSystem := requestContentAuditIncludeSystem()
+	scope := requestContentAuditScope()
 
+	if scope == auditScopeFull {
+		return buildFullAuditContent(content, request, includeSystem)
+	}
+
+	switch req := request.(type) {
+	case *dto.GeneralOpenAIRequest:
+		addIfNotEmpty(content, "messages", filterOpenAIMessages(req.Messages, scope, includeSystem))
+		addIfNotEmpty(content, "prompt", req.Prompt)
+		addIfNotEmpty(content, "input", filterGenericAuditInput(req.Input, scope, includeSystem))
+		if includeSystem {
+			addIfNotEmpty(content, "instruction", req.Instruction)
+		}
+		addIfNotEmpty(content, "prefix", req.Prefix)
+		addIfNotEmpty(content, "suffix", req.Suffix)
+	case *dto.OpenAIResponsesRequest:
+		if includeSystem {
+			addRawIfNotEmpty(content, "instructions", req.Instructions)
+		}
+		addIfNotEmpty(content, "input", filterOpenAIResponsesInput(req.Input, scope, includeSystem))
+	case *dto.ClaudeRequest:
+		if includeSystem {
+			addIfNotEmpty(content, "system", req.System)
+		}
+		addIfNotEmpty(content, "prompt", req.Prompt)
+		addIfNotEmpty(content, "messages", filterClaudeMessages(req.Messages, scope))
+	case *dto.GeminiChatRequest:
+		if includeSystem {
+			addIfNotEmpty(content, "system_instruction", req.SystemInstructions)
+		}
+		addIfNotEmpty(content, "contents", filterGeminiContents(req.Contents, scope))
+		addIfNotEmpty(content, "requests", filterGeminiRequests(req.Requests, scope, includeSystem))
+	case *dto.ImageRequest:
+		addIfNotEmpty(content, "prompt", req.Prompt)
+	case *dto.EmbeddingRequest:
+		addIfNotEmpty(content, "input", req.Input)
+	case *dto.RerankRequest:
+		addIfNotEmpty(content, "query", req.Query)
+		addIfNotEmpty(content, "documents", req.Documents)
+	}
+
+	if len(content) <= 2 {
+		return nil
+	}
+	return content
+}
+
+func buildFullAuditContent(content map[string]any, request dto.Request, includeSystem bool) map[string]any {
 	switch req := request.(type) {
 	case *dto.GeneralOpenAIRequest:
 		addIfNotEmpty(content, "messages", req.Messages)
@@ -155,7 +225,6 @@ func buildAuditContent(relayInfo *relaycommon.RelayInfo, request dto.Request) ma
 	default:
 		addIfNotEmpty(content, "request", request)
 	}
-
 	if len(content) <= 2 {
 		return nil
 	}
@@ -191,6 +260,14 @@ func addIfNotEmpty(dst map[string]any, key string, value any) {
 		if len(v) == 0 {
 			return
 		}
+	case []any:
+		if len(v) == 0 {
+			return
+		}
+	case []map[string]any:
+		if len(v) == 0 {
+			return
+		}
 	}
 	dst[key] = value
 }
@@ -205,6 +282,392 @@ func addRawIfNotEmpty(dst map[string]any, key string, value json.RawMessage) {
 		return
 	}
 	dst[key] = string(value)
+}
+
+func filterOpenAIMessages(messages []dto.Message, scope string, includeSystem bool) []dto.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	filtered := make([]dto.Message, 0, len(messages))
+	var latestUser *dto.Message
+	for _, message := range messages {
+		role := normalizeAuditRole(message.Role)
+		switch {
+		case role == "user":
+			message.Content = filterOpenAIUserContent(message.Content)
+			if isAuditContentEmpty(message.Content) {
+				continue
+			}
+			if scope == auditScopeCurrentUser {
+				latest := message
+				latestUser = &latest
+			} else {
+				filtered = append(filtered, message)
+			}
+		case includeSystem && isAuditSystemRole(role):
+			filtered = append(filtered, message)
+		}
+	}
+	if scope == auditScopeCurrentUser && latestUser != nil {
+		filtered = append(filtered, *latestUser)
+	}
+	return filtered
+}
+
+func filterClaudeMessages(messages []dto.ClaudeMessage, scope string) []dto.ClaudeMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	filtered := make([]dto.ClaudeMessage, 0, len(messages))
+	var latestUser *dto.ClaudeMessage
+	for _, message := range messages {
+		if normalizeAuditRole(message.Role) != "user" {
+			continue
+		}
+		message.Content = filterClaudeUserContent(message.Content)
+		if isAuditContentEmpty(message.Content) {
+			continue
+		}
+		if scope == auditScopeCurrentUser {
+			latest := message
+			latestUser = &latest
+		} else {
+			filtered = append(filtered, message)
+		}
+	}
+	if scope == auditScopeCurrentUser && latestUser != nil {
+		filtered = append(filtered, *latestUser)
+	}
+	return filtered
+}
+
+func filterGeminiContents(contents []dto.GeminiChatContent, scope string) []dto.GeminiChatContent {
+	if len(contents) == 0 {
+		return nil
+	}
+	filtered := make([]dto.GeminiChatContent, 0, len(contents))
+	var latestUser *dto.GeminiChatContent
+	for _, content := range contents {
+		role := normalizeAuditRole(content.Role)
+		if role != "" && role != "user" {
+			continue
+		}
+		content.Parts = filterGeminiUserParts(content.Parts)
+		if len(content.Parts) == 0 {
+			continue
+		}
+		if scope == auditScopeCurrentUser {
+			latest := content
+			latestUser = &latest
+		} else {
+			filtered = append(filtered, content)
+		}
+	}
+	if scope == auditScopeCurrentUser && latestUser != nil {
+		filtered = append(filtered, *latestUser)
+	}
+	return filtered
+}
+
+func filterGeminiRequests(requests []dto.GeminiChatRequest, scope string, includeSystem bool) []map[string]any {
+	if len(requests) == 0 {
+		return nil
+	}
+	filtered := make([]map[string]any, 0, len(requests))
+	for _, request := range requests {
+		item := make(map[string]any)
+		if includeSystem && request.SystemInstructions != nil {
+			item["system_instruction"] = request.SystemInstructions
+		}
+		if contents := filterGeminiContents(request.Contents, scope); len(contents) > 0 {
+			item["contents"] = contents
+		}
+		if nested := filterGeminiRequests(request.Requests, scope, includeSystem); len(nested) > 0 {
+			item["requests"] = nested
+		}
+		if len(item) > 0 {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func filterOpenAIResponsesInput(value json.RawMessage, scope string, includeSystem bool) any {
+	if len(value) == 0 || string(value) == "null" {
+		return nil
+	}
+	var decoded any
+	if err := common.Unmarshal(value, &decoded); err != nil {
+		return nil
+	}
+	return filterOpenAIResponsesDecodedInput(decoded, scope, includeSystem)
+}
+
+func filterGenericAuditInput(value any, scope string, includeSystem bool) any {
+	switch v := value.(type) {
+	case []any:
+		if hasAuditRoleItems(v) {
+			return filterOpenAIResponsesDecodedInput(v, scope, includeSystem)
+		}
+		return value
+	case map[string]any:
+		if isOpenAIResponsesUserItem(v) || isOpenAIResponsesSystemItem(v) {
+			return filterOpenAIResponsesDecodedInput(v, scope, includeSystem)
+		}
+		return value
+	default:
+		return value
+	}
+}
+
+func filterOpenAIResponsesDecodedInput(value any, scope string, includeSystem bool) any {
+	switch v := value.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		return v
+	case []any:
+		if len(v) == 0 {
+			return nil
+		}
+		if !hasAuditRoleItems(v) {
+			return v
+		}
+		filtered := make([]any, 0, len(v))
+		systemItems := make([]any, 0)
+		var latestUser any
+		for _, item := range v {
+			switch {
+			case isOpenAIResponsesUserItem(item):
+				item = filterOpenAIResponsesUserItem(item)
+				if isAuditContentEmpty(item) {
+					continue
+				}
+				if scope == auditScopeCurrentUser {
+					latestUser = item
+				} else {
+					filtered = append(filtered, item)
+				}
+			case includeSystem && isOpenAIResponsesSystemItem(item):
+				if scope == auditScopeCurrentUser {
+					systemItems = append(systemItems, item)
+				} else {
+					filtered = append(filtered, item)
+				}
+			}
+		}
+		if scope == auditScopeCurrentUser {
+			filtered = append(filtered, systemItems...)
+			if latestUser != nil {
+				filtered = append(filtered, latestUser)
+			}
+		}
+		if len(filtered) == 0 {
+			return nil
+		}
+		return filtered
+	case map[string]any:
+		if isOpenAIResponsesUserItem(v) {
+			return filterOpenAIResponsesUserItem(v)
+		}
+		if includeSystem && isOpenAIResponsesSystemItem(v) {
+			return v
+		}
+		return nil
+	default:
+		return value
+	}
+}
+
+func filterOpenAIResponsesUserItem(item any) any {
+	itemMap, ok := item.(map[string]any)
+	if !ok {
+		return item
+	}
+	out := copyAuditMap(itemMap)
+	if content, ok := out["content"]; ok {
+		out["content"] = filterOpenAIUserContent(content)
+	}
+	return out
+}
+
+func filterOpenAIUserContent(content any) any {
+	switch v := content.(type) {
+	case []any:
+		filtered := make([]any, 0, len(v))
+		for _, item := range v {
+			if shouldKeepOpenAIUserContentPart(item) {
+				filtered = append(filtered, item)
+			}
+		}
+		return filtered
+	default:
+		return content
+	}
+}
+
+func filterClaudeUserContent(content any) any {
+	switch v := content.(type) {
+	case []any:
+		filtered := make([]any, 0, len(v))
+		for _, item := range v {
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+					filtered = append(filtered, item)
+				}
+				continue
+			}
+			switch getAuditMapString(itemMap, "type") {
+			case "", "text", "image", "document":
+				filtered = append(filtered, item)
+			}
+		}
+		return filtered
+	default:
+		return content
+	}
+}
+
+func filterGeminiUserParts(parts []dto.GeminiPart) []dto.GeminiPart {
+	if len(parts) == 0 {
+		return nil
+	}
+	filtered := make([]dto.GeminiPart, 0, len(parts))
+	for _, part := range parts {
+		if part.Thought {
+			continue
+		}
+		kept := dto.GeminiPart{
+			MediaResolution: part.MediaResolution,
+			VideoMetadata:   part.VideoMetadata,
+		}
+		if part.Text != "" {
+			kept.Text = part.Text
+		}
+		if part.InlineData != nil {
+			kept.InlineData = part.InlineData
+		}
+		if part.FileData != nil {
+			kept.FileData = part.FileData
+		}
+		if kept.Text != "" || kept.InlineData != nil || kept.FileData != nil {
+			filtered = append(filtered, kept)
+		}
+	}
+	return filtered
+}
+
+func shouldKeepOpenAIUserContentPart(item any) bool {
+	itemMap, ok := item.(map[string]any)
+	if !ok {
+		if text, ok := item.(string); ok {
+			return strings.TrimSpace(text) != ""
+		}
+		return false
+	}
+	partType := getAuditMapString(itemMap, "type")
+	switch partType {
+	case "", "text", "input_text", "image_url", "input_image", "input_audio", "file", "input_file", "video_url", "audio", "image", "document":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasAuditRoleItems(items []any) bool {
+	for _, item := range items {
+		if _, ok := item.(string); ok {
+			continue
+		}
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role := getAuditMapString(itemMap, "role")
+		itemType := getAuditMapString(itemMap, "type")
+		if role != "" || itemType == "message" || strings.HasPrefix(itemType, "function_") || itemType == "reasoning" || strings.HasPrefix(itemType, "input_") {
+			return true
+		}
+	}
+	return false
+}
+
+func isOpenAIResponsesUserItem(item any) bool {
+	if text, ok := item.(string); ok {
+		return strings.TrimSpace(text) != ""
+	}
+	itemMap, ok := item.(map[string]any)
+	if !ok {
+		return false
+	}
+	role := getAuditMapString(itemMap, "role")
+	itemType := getAuditMapString(itemMap, "type")
+	return role == "user" || (role == "" && (itemType == "input_text" || itemType == "input_image" || itemType == "input_file"))
+}
+
+func isOpenAIResponsesSystemItem(item any) bool {
+	itemMap, ok := item.(map[string]any)
+	if !ok {
+		return false
+	}
+	return isAuditSystemRole(getAuditMapString(itemMap, "role"))
+}
+
+func isAuditSystemRole(role string) bool {
+	return role == "system" || role == "developer"
+}
+
+func normalizeAuditRole(role string) string {
+	return strings.ToLower(strings.TrimSpace(role))
+}
+
+func getAuditMapString(item map[string]any, key string) string {
+	value, ok := item[key]
+	if !ok {
+		return ""
+	}
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(text))
+}
+
+func copyAuditMap(src map[string]any) map[string]any {
+	out := make(map[string]any, len(src))
+	for key, value := range src {
+		out[key] = value
+	}
+	return out
+}
+
+func isAuditContentEmpty(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []any:
+		return len(v) == 0
+	case []dto.Message:
+		return len(v) == 0
+	case []dto.ClaudeMessage:
+		return len(v) == 0
+	case []dto.GeminiChatContent:
+		return len(v) == 0
+	case map[string]any:
+		if content, ok := v["content"]; ok {
+			return isAuditContentEmpty(content)
+		}
+		if text, ok := v["text"]; ok {
+			return isAuditContentEmpty(text)
+		}
+		return len(v) == 0
+	default:
+		return false
+	}
 }
 
 func sanitizeAuditValue(value any) any {

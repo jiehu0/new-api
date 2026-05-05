@@ -27,6 +27,25 @@ type RequestContentLog struct {
 	CreatedAt   int64  `json:"created_at" gorm:"bigint;index:idx_request_content_created_id,priority:2"`
 }
 
+type RequestContentLogListItem struct {
+	Id            int    `json:"id"`
+	RequestId     string `json:"request_id"`
+	UserId        int    `json:"user_id"`
+	Username      string `json:"username"`
+	TokenId       int    `json:"token_id"`
+	TokenName     string `json:"token_name"`
+	ChannelId     int    `json:"channel_id"`
+	ModelName     string `json:"model_name"`
+	Group         string `json:"group"`
+	RelayMode     int    `json:"relay_mode"`
+	Path          string `json:"path"`
+	ContentText   string `json:"content_text"`
+	ContentHash   string `json:"content_hash"`
+	ContentLength int64  `json:"content_length"`
+	Truncated     bool   `json:"truncated"`
+	CreatedAt     int64  `json:"created_at"`
+}
+
 type RequestContentLogQuery struct {
 	UserId         int
 	Username       string
@@ -51,7 +70,7 @@ func RecordRequestContentLog(log *RequestContentLog) error {
 	return LOG_DB.Create(log).Error
 }
 
-func GetRequestContentLogs(query RequestContentLogQuery, startIdx int, num int) (logs []*RequestContentLog, total int64, err error) {
+func GetRequestContentLogs(query RequestContentLogQuery, startIdx int, num int) (logs []*RequestContentLogListItem, total int64, err error) {
 	tx, err := buildRequestContentLogQuery(query)
 	if err != nil {
 		return nil, 0, err
@@ -59,7 +78,11 @@ func GetRequestContentLogs(query RequestContentLogQuery, startIdx int, num int) 
 	if err = tx.Model(&RequestContentLog{}).Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
-	err = tx.Order("request_content_logs.id desc").Limit(num).Offset(startIdx).Find(&logs).Error
+	err = tx.Select(requestContentLogListSelectClause()).
+		Order("request_content_logs.id desc").
+		Limit(num).
+		Offset(startIdx).
+		Scan(&logs).Error
 	return logs, total, err
 }
 
@@ -137,4 +160,23 @@ func requestContentLikePattern(input string) string {
 		"_", "!_",
 	)
 	return "%" + replacer.Replace(input) + "%"
+}
+
+func requestContentLogListSelectClause() string {
+	return "request_content_logs.id, " +
+		"request_content_logs.request_id, " +
+		"request_content_logs.user_id, " +
+		"request_content_logs.username, " +
+		"request_content_logs.token_id, " +
+		"request_content_logs.token_name, " +
+		"request_content_logs.channel_id, " +
+		"request_content_logs.model_name, " +
+		"request_content_logs." + logGroupCol + ", " +
+		"request_content_logs.relay_mode, " +
+		"request_content_logs.path, " +
+		"request_content_logs.content_text, " +
+		"request_content_logs.content_hash, " +
+		"LENGTH(request_content_logs.content) AS content_length, " +
+		"request_content_logs.truncated, " +
+		"request_content_logs.created_at"
 }
