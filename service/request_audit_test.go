@@ -1,12 +1,15 @@
 package service
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/gin-gonic/gin"
 )
 
 func TestBuildAuditContentResponses(t *testing.T) {
@@ -167,6 +170,91 @@ func TestSanitizeAuditValueOmitsMediaData(t *testing.T) {
 	}
 }
 
+func TestBuildRequestContentLogDoesNotCaptureHeadersByDefault(t *testing.T) {
+	log := buildHeaderAuditLogForTest(t)
+
+	if log.RequestHeaders != "" {
+		t.Fatalf("request headers should be empty by default, got %q", log.RequestHeaders)
+	}
+}
+
+func TestBuildRequestContentLogCapturesSanitizedHeadersWhenEnabled(t *testing.T) {
+	t.Setenv(requestContentAuditIncludeHeadersEnv, "true")
+	log := buildHeaderAuditLogForTest(t)
+
+	if log.RequestHeaders == "" {
+		t.Fatal("request headers should be captured")
+	}
+	if strings.Contains(log.RequestHeaders, "secret-token") ||
+		strings.Contains(log.RequestHeaders, "session=secret") ||
+		strings.Contains(log.RequestHeaders, "upstream-secret") {
+		t.Fatalf("request headers leaked sensitive value: %s", log.RequestHeaders)
+	}
+
+	var headers map[string][]string
+	if err := common.UnmarshalJsonStr(log.RequestHeaders, &headers); err != nil {
+		t.Fatal(err)
+	}
+	assertHeaderValueForTest(t, headers, "X-Codex-Beta-Features", "fast-mode")
+	assertHeaderValueForTest(t, headers, "Openai-Beta", "responses=v1")
+	assertHeaderValueForTest(t, headers, "User-Agent", "Codex CLI")
+	assertHeaderValueForTest(t, headers, "Authorization", omittedAuditValue)
+	assertHeaderValueForTest(t, headers, "Cookie", omittedAuditValue)
+	assertHeaderValueForTest(t, headers, "X-Trace-Auth", omittedAuditValue)
+}
+
 func buildAuditJSONForTest(value any) ([]byte, error) {
 	return common.Marshal(value)
+}
+
+func buildHeaderAuditLogForTest(t *testing.T) *model.RequestContentLog {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	req.Host = "new-api.example.test"
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("Cookie", "session=secret")
+	req.Header.Set("X-Trace-Auth", "Bearer upstream-secret")
+	req.Header.Set("X-Codex-Beta-Features", "fast-mode")
+	req.Header.Set("OpenAI-Beta", "responses=v1")
+	req.Header.Set("User-Agent", "Codex CLI")
+	c.Request = req
+	c.Set(common.RequestIdKey, "req-test")
+
+	info := &relaycommon.RelayInfo{
+		UserId:          7,
+		TokenId:         11,
+		OriginModelName: "gpt-test",
+		UsingGroup:      "default",
+		RelayMode:       37,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: 13,
+		},
+	}
+	request := &dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: []byte(`"hello"`),
+	}
+	log, err := buildRequestContentLog(c, info, request, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log == nil {
+		t.Fatal("request content log is nil")
+	}
+	return log
+}
+
+func assertHeaderValueForTest(t *testing.T, headers map[string][]string, key string, want string) {
+	t.Helper()
+	values, ok := headers[key]
+	if !ok || len(values) == 0 {
+		t.Fatalf("header %s missing in %#v", key, headers)
+	}
+	if values[0] != want {
+		t.Fatalf("header %s = %q, want %q", key, values[0], want)
+	}
 }

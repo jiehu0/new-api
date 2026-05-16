@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -21,27 +22,30 @@ import (
 )
 
 const (
-	requestContentAuditEnabledEnv       = "REQUEST_CONTENT_AUDIT_ENABLED"
-	requestContentAuditMaxBytesEnv      = "REQUEST_CONTENT_AUDIT_MAX_BYTES"
-	requestContentAuditIncludeSystemEnv = "REQUEST_CONTENT_AUDIT_INCLUDE_SYSTEM"
-	requestContentAuditScopeEnv         = "REQUEST_CONTENT_AUDIT_SCOPE"
-	requestContentAuditDedupeEnabledEnv = "REQUEST_CONTENT_AUDIT_DEDUPE_ENABLED"
-	requestContentAuditDedupeWindowEnv  = "REQUEST_CONTENT_AUDIT_DEDUPE_WINDOW_SECONDS"
-	requestContentAuditMaxStorageEnv    = "REQUEST_CONTENT_AUDIT_MAX_STORAGE_BYTES"
-	requestContentAuditCleanupRatioEnv  = "REQUEST_CONTENT_AUDIT_CLEANUP_TARGET_RATIO"
-	requestContentAuditCleanupBatchEnv  = "REQUEST_CONTENT_AUDIT_CLEANUP_BATCH_SIZE"
+	requestContentAuditEnabledEnv             = "REQUEST_CONTENT_AUDIT_ENABLED"
+	requestContentAuditMaxBytesEnv            = "REQUEST_CONTENT_AUDIT_MAX_BYTES"
+	requestContentAuditIncludeSystemEnv       = "REQUEST_CONTENT_AUDIT_INCLUDE_SYSTEM"
+	requestContentAuditIncludeHeadersEnv      = "REQUEST_CONTENT_AUDIT_INCLUDE_HEADERS"
+	requestContentAuditMaxHeaderValueBytesEnv = "REQUEST_CONTENT_AUDIT_MAX_HEADER_VALUE_BYTES"
+	requestContentAuditScopeEnv               = "REQUEST_CONTENT_AUDIT_SCOPE"
+	requestContentAuditDedupeEnabledEnv       = "REQUEST_CONTENT_AUDIT_DEDUPE_ENABLED"
+	requestContentAuditDedupeWindowEnv        = "REQUEST_CONTENT_AUDIT_DEDUPE_WINDOW_SECONDS"
+	requestContentAuditMaxStorageEnv          = "REQUEST_CONTENT_AUDIT_MAX_STORAGE_BYTES"
+	requestContentAuditCleanupRatioEnv        = "REQUEST_CONTENT_AUDIT_CLEANUP_TARGET_RATIO"
+	requestContentAuditCleanupBatchEnv        = "REQUEST_CONTENT_AUDIT_CLEANUP_BATCH_SIZE"
 
 	auditScopeCurrentUser = "current_user"
 	auditScopeAllUser     = "all_user"
 	auditScopeFull        = "full"
 
-	defaultRequestContentAuditMaxBytes = 65535
-	defaultRequestContentAuditScope    = auditScopeCurrentUser
-	defaultRequestContentDedupeWindow  = 300
-	defaultRequestContentMaxStorage    = int64(20 * 1024 * 1024 * 1024)
-	defaultRequestContentCleanupRatio  = 0.9
-	defaultRequestContentCleanupBatch  = 1000
-	omittedAuditValue                  = "[omitted]"
+	defaultRequestContentAuditMaxBytes            = 65535
+	defaultRequestContentAuditMaxHeaderValueBytes = 4096
+	defaultRequestContentAuditScope               = auditScopeCurrentUser
+	defaultRequestContentDedupeWindow             = 300
+	defaultRequestContentMaxStorage               = int64(20 * 1024 * 1024 * 1024)
+	defaultRequestContentCleanupRatio             = 0.9
+	defaultRequestContentCleanupBatch             = 1000
+	omittedAuditValue                             = "[omitted]"
 )
 
 var requestContentAuditCleanupRunning atomic.Bool
@@ -81,6 +85,18 @@ func requestContentAuditEnabled() bool {
 
 func requestContentAuditIncludeSystem() bool {
 	return common.GetEnvOrDefaultBool(requestContentAuditIncludeSystemEnv, false)
+}
+
+func requestContentAuditIncludeHeaders() bool {
+	return common.GetEnvOrDefaultBool(requestContentAuditIncludeHeadersEnv, false)
+}
+
+func requestContentAuditMaxHeaderValueBytes() int {
+	maxBytes := common.GetEnvOrDefault(requestContentAuditMaxHeaderValueBytesEnv, defaultRequestContentAuditMaxHeaderValueBytes)
+	if maxBytes <= 0 {
+		return defaultRequestContentAuditMaxHeaderValueBytes
+	}
+	return maxBytes
 }
 
 func requestContentAuditScope() string {
@@ -197,6 +213,11 @@ func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, re
 	}
 	contentText = truncateAuditString(contentText, maxBytes)
 
+	requestHeaders, err := buildAuditRequestHeaders(c)
+	if err != nil {
+		return nil, err
+	}
+
 	sum := sha256.Sum256(contentBytes)
 	username := c.GetString(string(constant.ContextKeyUserName))
 	tokenName := c.GetString("token_name")
@@ -219,14 +240,100 @@ func buildRequestContentLog(c *gin.Context, relayInfo *relaycommon.RelayInfo, re
 		Path:           c.Request.URL.Path,
 		Content:        string(contentBytes),
 		ContentText:    contentText,
+		RequestHeaders: requestHeaders,
 		ContentHash:    hex.EncodeToString(sum[:]),
 		DuplicateCount: 1,
 		LastRequestId:  requestId,
 		LastSeenAt:     now,
-		StorageBytes:   model.EstimateRequestContentLogStorageBytes(string(contentBytes), contentText),
+		StorageBytes:   model.EstimateRequestContentLogStorageBytes(string(contentBytes), contentText, requestHeaders),
 		Truncated:      truncated,
 		CreatedAt:      now,
 	}, nil
+}
+
+func buildAuditRequestHeaders(c *gin.Context) (string, error) {
+	if !requestContentAuditIncludeHeaders() || c == nil || c.Request == nil {
+		return "", nil
+	}
+
+	headers := make(map[string][]string, len(c.Request.Header)+1)
+	if host := strings.TrimSpace(c.Request.Host); host != "" {
+		headers["Host"] = []string{truncateAuditString(host, requestContentAuditMaxHeaderValueBytes())}
+	}
+	for key, values := range c.Request.Header {
+		name := http.CanonicalHeaderKey(strings.TrimSpace(key))
+		if name == "" {
+			continue
+		}
+		sanitized := sanitizeAuditHeaderValues(name, values)
+		if len(sanitized) == 0 {
+			continue
+		}
+		headers[name] = sanitized
+	}
+	if len(headers) == 0 {
+		return "", nil
+	}
+
+	data, err := common.Marshal(headers)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func sanitizeAuditHeaderValues(name string, values []string) []string {
+	if shouldOmitAuditHeaderKey(name) {
+		return []string{omittedAuditValue}
+	}
+	maxBytes := requestContentAuditMaxHeaderValueBytes()
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		switch {
+		case shouldOmitAuditHeaderValue(value), shouldOmitString(value):
+			out = append(out, omittedAuditValue)
+		default:
+			out = append(out, truncateAuditString(value, maxBytes))
+		}
+	}
+	return out
+}
+
+func shouldOmitAuditHeaderKey(key string) bool {
+	key = normalizeAuditHeaderKey(key)
+	switch key {
+	case "authorization", "proxy_authorization", "cookie", "set_cookie",
+		"api_key", "x_api_key", "x_openai_api_key", "openai_api_key",
+		"anthropic_api_key", "x_goog_api_key", "google_api_key",
+		"x_auth_token", "x_csrf_token", "x_csrftoken",
+		"cf_access_client_secret":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldOmitAuditHeaderValue(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "bearer ") ||
+		strings.HasPrefix(lower, "basic ") ||
+		strings.HasPrefix(lower, "digest ") ||
+		strings.HasPrefix(lower, "token ") ||
+		strings.HasPrefix(lower, "apikey ") ||
+		strings.HasPrefix(lower, "api-key ") {
+		return true
+	}
+	return strings.HasPrefix(trimmed, "sk-") && len(trimmed) > 20
+}
+
+func normalizeAuditHeaderKey(key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	return strings.ReplaceAll(key, "-", "_")
 }
 
 func buildAuditContent(relayInfo *relaycommon.RelayInfo, request dto.Request) map[string]any {

@@ -22,6 +22,7 @@ type RequestContentLog struct {
 	Path           string `json:"path" gorm:"type:varchar(255);default:''"`
 	Content        string `json:"content" gorm:"type:text"`
 	ContentText    string `json:"content_text" gorm:"type:text"`
+	RequestHeaders string `json:"request_headers" gorm:"type:text"`
 	ContentHash    string `json:"content_hash" gorm:"type:varchar(64);index;default:''"`
 	DuplicateCount int    `json:"duplicate_count" gorm:"default:1"`
 	LastRequestId  string `json:"last_request_id" gorm:"type:varchar(64);index;default:''"`
@@ -93,10 +94,15 @@ func RecordRequestContentLogWithDedupe(log *RequestContentLog, windowSeconds int
 	cutoff := log.LastSeenAt - windowSeconds
 	return LOG_DB.Transaction(func(tx *gorm.DB) error {
 		existing := &RequestContentLog{}
-		err := tx.Where("user_id = ? AND token_id = ? AND path = ? AND model_name = ? AND relay_mode = ? AND content_hash = ?",
+		query := tx.Where("user_id = ? AND token_id = ? AND path = ? AND model_name = ? AND relay_mode = ? AND content_hash = ?",
 			log.UserId, log.TokenId, log.Path, log.ModelName, log.RelayMode, log.ContentHash).
-			Where("(last_seen_at >= ? OR (last_seen_at = 0 AND created_at >= ?))", cutoff, cutoff).
-			Order(requestContentLogSeenAtExpr() + " DESC").
+			Where("(last_seen_at >= ? OR (last_seen_at = 0 AND created_at >= ?))", cutoff, cutoff)
+		if strings.TrimSpace(log.RequestHeaders) != "" {
+			query = query.Where("request_headers = ?", log.RequestHeaders)
+		} else {
+			query = query.Where("(request_headers = ? OR request_headers IS NULL)", "")
+		}
+		err := query.Order(requestContentLogSeenAtExpr() + " DESC").
 			Order("id desc").
 			First(existing).Error
 		if err == nil {
@@ -294,7 +300,7 @@ func requestContentLogListSelectClause() string {
 		"request_content_logs.duplicate_count, " +
 		"request_content_logs.last_request_id, " +
 		"request_content_logs.last_seen_at, " +
-		"CASE WHEN request_content_logs.storage_bytes > 0 THEN request_content_logs.storage_bytes ELSE LENGTH(request_content_logs.content) + LENGTH(request_content_logs.content_text) + 1024 END AS storage_bytes, " +
+		"CASE WHEN request_content_logs.storage_bytes > 0 THEN request_content_logs.storage_bytes ELSE LENGTH(request_content_logs.content) + LENGTH(request_content_logs.content_text) + COALESCE(LENGTH(request_content_logs.request_headers), 0) + 1024 END AS storage_bytes, " +
 		"request_content_logs.truncated, " +
 		"request_content_logs.created_at"
 }
@@ -313,7 +319,7 @@ func prepareRequestContentLogDefaults(log *RequestContentLog) {
 		log.DuplicateCount = 1
 	}
 	if log.StorageBytes <= 0 {
-		log.StorageBytes = EstimateRequestContentLogStorageBytes(log.Content, log.ContentText)
+		log.StorageBytes = EstimateRequestContentLogStorageBytes(log.Content, log.ContentText, log.RequestHeaders)
 	}
 }
 
@@ -322,9 +328,13 @@ func requestContentLogSeenAtExpr() string {
 }
 
 func requestContentLogStorageSumExpr() string {
-	return "COALESCE(SUM(CASE WHEN request_content_logs.storage_bytes > 0 THEN request_content_logs.storage_bytes ELSE LENGTH(request_content_logs.content) + LENGTH(request_content_logs.content_text) + 1024 END), 0)"
+	return "COALESCE(SUM(CASE WHEN request_content_logs.storage_bytes > 0 THEN request_content_logs.storage_bytes ELSE LENGTH(request_content_logs.content) + LENGTH(request_content_logs.content_text) + COALESCE(LENGTH(request_content_logs.request_headers), 0) + 1024 END), 0)"
 }
 
-func EstimateRequestContentLogStorageBytes(content string, contentText string) int64 {
-	return int64(len(content) + len(contentText) + 1024)
+func EstimateRequestContentLogStorageBytes(content string, contentText string, extras ...string) int64 {
+	total := len(content) + len(contentText) + 1024
+	for _, extra := range extras {
+		total += len(extra)
+	}
+	return int64(total)
 }
